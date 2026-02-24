@@ -1,0 +1,63 @@
+{
+  "dev": {
+    "identifiers":  "birb_0001",
+    "name": "Birb"
+  },
+  "cmps": {
+    "birb_0001_state": {
+      "p": "binary_sensor",
+      "name": "State",
+      "device_class": "problem",
+      "payload_on": "ON",
+      "payload_off": "OFF",
+      "value_template": "{% raw %} {{ value_json.state }} {% endraw %}",
+      "unique_id": "birb_0001_state"
+    },
+    "birb_0001_t": {
+      "p": "sensor",
+      "name": "Temperature",
+      "device_class": "temperature",
+      "unit_of_measurement": "°C",
+      "value_template": "{% raw %} {{ value_json.temperature }} {% endraw %}",
+      "unique_id": "birb_0001_t"
+    },
+    "birb_0001_h": {
+      "p": "sensor",
+      "name": "Humidity",
+      "device_class": "humidity",
+      "unit_of_measurement": "%",
+      "value_template": "{% raw %} {{ value_json.humidity }} {% endraw %}",
+      "unique_id": "birb_0001_h"
+    },
+    "birb_0001_eco2": {
+      "p": "sensor",
+      "name": "eCO2",
+      "device_class": "carbon_dioxide",
+      "unit_of_measurement": "ppm",
+      "value_template": "{% raw %} {{ value_json.eco2 }} {% endraw %}",
+      "unique_id": "birb_0001_eco2"
+    },
+    "birb_0001_tvoc": {
+      "p": "sensor",
+      "name": "TVOC",
+      "device_class": "volatile_organic_compounds_parts",
+      "unit_of_measurement": "ppb",
+      "value_template": "{% raw %} {{ value_json.tvoc }} {% endraw %}",
+      "unique_id": "birb_0001_TVOC"
+    },
+    "birb_0001_aqi": {
+      "p": "sensor",
+      "name": "AQI",
+      "device_class": "aqi",
+      "value_template": "{% raw %} {{ value_json.aqi }} {% endraw %}",
+      "unique_id": "birb_0001_aqi"
+    }
+  },
+  "o": {
+    "name": "KasperHesse/Birb",
+    "sw": "1.0",
+    "url": "https://github.com/KasperHesse/Birb"
+  },
+  "qos": 0,
+  "state_topic": "homeassistant/device/birb/state"
+}
