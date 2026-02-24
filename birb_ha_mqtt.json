@@ -1,0 +1,49 @@
+{
+  "dev": {
+    "ids": "abcdefg",
+    "name": "Birb",
+    "mf": "Bla electronics"
+  },
+  "o": {
+    "name": "Birb2MQTT",
+    "sw": "1.0"
+  },
+  "cmps": {
+    "birb_0001_t": {
+      "p": "sensor",
+      "device_class": "temperature",
+      "unit_of_measurement": "°C",
+      "value_template": "{{ value_json.temperature}}",
+      "unique_id": "birb_0001_t"
+    },
+    "birb_0001_h": {
+      "p": "sensor",
+      "device_class": "humidity",
+      "unit_of_measurement": "%",
+      "value_template": "{{ value_json.humidity}}",
+      "unique_id": "birb_0001_h"
+    },
+    "birb_0001_eco2": {
+      "p": "sensor",
+      "device_class": "carbon_dioxide",
+      "unit_of_measurement": "ppm",
+      "value_template": "{{value_json.eco2}}",
+      "unique_id": "birb_0001_eco2"
+    },
+    "birb_0001_tvoc": {
+      "p": "sensor",
+      "device_class": "volatile_organic_compounds_parts",
+      "unit_of_measurement": "ppb",
+      "value_template": "{{value_json.tvoc}}",
+      "unique_id": "birb_0001_TVOC"
+    },
+    "birb_0001_aqi": {
+      "p": "sensor",
+      "device_class": "aqi",
+      "value_template": "{{value_json.aqi}}",
+      "unique_id": "birb_0001_aqi"
+    },
+    "state_topic": "sensorBedroom/state",
+    "qos": 2
+  }
+}
