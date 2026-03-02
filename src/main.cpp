@@ -5,11 +5,17 @@
 #include "ESP8266_ISR_Servo.h"
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
-#include <ArduinoJson.h>
 #include "secrets.h"
 
 #define SCL_PIN PIN_WIRE_SCL //5
 #define SDA_PIN PIN_WIRE_SDA //4
+
+#define ABS(x) (x < 0 ? -x : x)
+#define SIGN(x) (x < 0 ? -1 : 1)
+
+#define WIFI_CONNECT_NUM_ATTEMPTS 10
+#define MQTT_CONNECT_NUM_ATTEMPTS 10
+#define SAMPLE_PERIOD_MS 10000
 
 /****AHT21 sensor****/
 #define AHT21_I2C_ADDRESS 0x38
@@ -22,13 +28,19 @@ float humidity_float, temp_float;
 ENS160 ens160;
 //humidity and temp reformatted to format required for ENS160 calibration
 uint16_t humidity_ens, temp_ens;
+uint8_t aqi_uba;
+uint16_t tvoc;
+uint16_t eco2;
 
 /****Birb servo****/
 #define SERVO_MIN_MICROS      544
 #define SERVO_MAX_MICROS      2450
 #define SERVO_PIN             2
+#define BIRB_STEPS_PER_SECOND 20
+#define BIRB_STEP_PERIOD_MS   1000 / BIRB_STEPS_PER_SECOND
 int servo_idx;
 int birb_position;
+bool birb_is_dead;
 
 /****MQTT****/
 /* Required states / events:
@@ -40,118 +52,198 @@ int birb_position;
 - Publish bird state (bool)
 
 - Subscribe home assistant status (bool)
-- Subscribe HA-generated birb status override (bool)
-- Substribe HA-generated temp values?
+- Subscribe HA-generated birb status override (enum)
 */
 #define MQTT_CLIENT_ID "Birb-Mqtt-Client"
-#define HA_DISCOVERY_TOPIC "homeassistant/device/birb/config"
+#define MQTT_DISCOVERY_TOPIC "homeassistant/device/birb/config"
+#define MQTT_STATE_TOPIC "homeassistant/device/birb/state"
+#define MQTT_HA_STATUS_TOPIC "homeassistant/status"
+#define MQTT_STATE_OVERRIDE_TOPIC "homeassistant/device/birb/state_override"
 WiFiClient espClient;
 PubSubClient mqtt_client(espClient);
+bool should_send_discovery_message;
+bool should_send_mqtt_updates;
+const char* MQTT_HA_DISCOVERY_PAYLOAD = "{\"dev\":{\"identifiers\":\"birb_0001\",\"name\":\"Birb\"},\"cmps\":{\"birb_0001_state\":{\"p\":\"binary_sensor\",\"name\":\"State\",\"device_class\":\"problem\",\"payload_on\":\"ON\",\"payload_off\":\"OFF\",\"value_template\":\" {{ value_json.state }} \",\"unique_id\":\"birb_0001_state\"},\"birb_0001_t\":{\"p\":\"sensor\",\"name\":\"Temperature\",\"device_class\":\"temperature\",\"unit_of_measurement\":\"°C\",\"value_template\":\" {{ value_json.temp }} \",\"unique_id\":\"birb_0001_t\"},\"birb_0001_h\":{\"p\":\"sensor\",\"name\":\"Humidity\",\"device_class\":\"humidity\",\"unit_of_measurement\":\"%\",\"value_template\":\" {{ value_json.hum }} \",\"unique_id\":\"birb_0001_h\"},\"birb_0001_eco2\":{\"p\":\"sensor\",\"name\":\"eCO2\",\"device_class\":\"carbon_dioxide\",\"unit_of_measurement\":\"ppm\",\"value_template\":\" {{ value_json.eco2 }} \",\"unique_id\":\"birb_0001_eco2\"},\"birb_0001_tvoc\":{\"p\":\"sensor\",\"name\":\"TVOC\",\"device_class\":\"volatile_organic_compounds_parts\",\"unit_of_measurement\":\"ppb\",\"value_template\":\" {{ value_json.tvoc }} \",\"unique_id\":\"birb_0001_tvoc\"},\"birb_0001_aqi\":{\"p\":\"sensor\",\"name\":\"AQI\",\"device_class\":\"aqi\",\"value_template\":\" {{ value_json.aqi }} \",\"unique_id\":\"birb_0001_aqi\"},\"birb_0001_override\":{\"p\":\"select\",\"name\":\"Override\",\"command_topic\":\"homeassistant/device/birb/state_override\",\"options\":[\"OFF\",\"ALIVE\",\"DEAD\"],\"qos\": 1,\"unique_id\":\"birb_0001_override\"}},\"o\":{\"name\":\"KasperHesse/Birb\",\"sw\":\"1.0\",\"url\":\"https://github.com/KasperHesse/Birb\"},\"qos\":0,\"state_topic\":\"homeassistant/device/birb/state\"}";
+
+typedef enum {
+  OFF, DEAD, ALIVE
+} birb_state_override_t;
+birb_state_override_t birb_state_override;
 
 
 /****Other sensors and outputs****/
 bool led_state;
 
-void print_ens160_compensation_registers() {
-  uint8_t rdata[4];
-  uint16_t temp_raw, hum_raw;
-  float temp_parsed, hum_parsed;
+/*
+General flow:
+- On power up: Attempt to connect to MQTT (try_connect_mqtt_broker == true)
+  - If not connected after 5 attempts
+    - Set timer for 5 minutes, try again, exit early
+    - Set should_send_discovery_message false
+    - Set should_send_mqtt_updates false
+  - If connected:
+    - Set should_send_discovery_message == true
+     -Set should_send_mqtt_updates true
+     -Set try_connect_mqtt_broker false
+- Every N seconds (TBD)
+  - Send discovery if not already sent, reset flag (include random delay)
+  - Make measurements, store in relevant variables
+  - Publish measurements over MQTT
+  - Change birb position if required (true == dead, false == live)
+  - Delay
 
-  ens160.read(ENS16X_REGISTER_ADDRESS_DATA_T, rdata, 4);
-  temp_raw = rdata[1];
-  temp_raw <<= 8;
-  temp_raw |= rdata[0];
-  hum_raw = rdata[3];
-  hum_raw <<= 8;
-  hum_raw |= rdata[2];
+- Subscribe to topics
+  - HA discovery topic
+    - If message: Enable/disable flags for sending MQTT updates and sending discovery message
+  - HA birb state override (topic TBD)
+    - If message: Set override value
 
-  temp_parsed = ((float) temp_raw / 64) - 273.15;
-  hum_parsed = ((float) hum_raw) / 512;
+- Interrupts
+  - N minute timer if mqtt not connected
+    - Set try_connect_mqtt_broker true
 
-  
-  Serial.printf("ENS160 temp comp: raw=%04x, converted=%2.2f\n", temp_raw, temp_parsed);
-  Serial.printf("ENS160 hum  comp: raw=%04x, converted=%2.2f\n", hum_raw, hum_parsed);
+
+TO BE CONSIDERED: How are mqtt messages handled while in deep sleep??
+*/
+
+bool wifi_is_connected() {
+  return WiFi.status() == WL_CONNECTED;
 }
 
-/** Enable WiFi connection. Blocks until WiFi-connection is established */
+bool mqtt_is_connected() {
+  return mqtt_client.connected();
+}
+
+void start_wifi_mqtt_reconnect_timer() {
+  //TODO: Implement me
+  //Start timer countdown that sets flag to retry WiFi and MQTT connection after delay
+}
+
+/** Enable WiFi connection.
+ *
+ * Performs WIFI_CONNECT_NUM_ATTEMPTS attempts with a 1-second delay to establish connection
+ */
 void setup_wifi() {
+  int num_attempts;
   delay(10);
-  Serial.printf("Conneting to wifi %s\n", WIFI_SSID_NAME);
+  Serial.printf("Connecting to wifi %s\n", WIFI_SSID_NAME);
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID_NAME, WIFI_PASSWORD);
 
   //TODO: Fallback to run without WiFi if not connected
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+  for(num_attempts=0; num_attempts<WIFI_CONNECT_NUM_ATTEMPTS; num_attempts++) {
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("WiFi connected");
+      Serial.printf("IP address: %s\n", WiFi.localIP().toString().c_str());
+      break;
+    }
+    delay(1000);
     Serial.print(".");
   }
-
-  randomSeed(micros());
-  Serial.println("WiFi connected");
-  Serial.printf("IP address: %p", WiFi.localIP());
+  if (!wifi_is_connected()) {
+    Serial.printf("WiFi was NOT connected. Status=%d\n", WiFi.status());
+    start_wifi_mqtt_reconnect_timer();
+    should_send_discovery_message = false;
+    should_send_mqtt_updates = false;
+  }
+  randomSeed(micros()); //Unsure of reason, in MQTT example
 }
 
-void publish_mqtt_ha_sensors() {
-  JsonDocument json;
-}
-
-/**Establish MQTT connection, creating initial broadcast message of all sensors */
+/**Establish MQTT connection, creating initial broadcast message of all sensors
+ *
+ * Performs MQTT_CONNECT_NUM_ATTEMPTS attempts with a 1-second delay to establish connection
+ */
 void mqtt_connect() {
-  while(!mqtt_client.connected()) {
-    Serial.print("Attempting MQTT connection ...");
-    String clientID = "Birb-Client-";
-    clientID += String(random(0xffff), HEX);
+  uint8_t num_attempts;
 
-    //TODO pretty sure we're using username and password as well
-    if (mqtt_client.connect(MQTT_CLIENT_ID)) {
-      Serial.println("MQTT connection established");
+  for(num_attempts=0; num_attempts<MQTT_CONNECT_NUM_ATTEMPTS; num_attempts++) {
+    Serial.print("Attempting MQTT connection, attempt ");
+    Serial.println(num_attempts);
+
+    if (mqtt_client.connect(MQTT_CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD, 0, 0, 0, 0, 0)) {
+      should_send_discovery_message = true;
+      should_send_mqtt_updates = true;
+      Serial.println("MQTT connection established. Subscribing to topics");
+
       mqtt_client.publish("mqtt_test/outTopic", "hello world");
-      mqtt_client.subscribe("mqtt_test/inTopic"); 
+      mqtt_client.subscribe(MQTT_HA_STATUS_TOPIC, 1);
+      mqtt_client.subscribe(MQTT_STATE_OVERRIDE_TOPIC, 1);
+      break;
     } else {
       Serial.print("failed, rc=");
       Serial.print(mqtt_client.state());
-      Serial.println(" try again in 5 seconds");
-      delay(5000);
+      Serial.println(" trying again in 3 seconds");
+      delay(3000);
     }
   }
 }
 
-
-
-void setup() {
-  Serial.begin(115200);
-
-  Wire.begin(SDA_PIN, SCL_PIN);
-
-  //Setup AHT sensor on I2C bus
-  Serial.println("Starting AHT21");
-  aht.begin(&Wire);
-
-  //Setup ENS160 sensor on I2C bus
-  Serial.println("Starting ENS160");
-  ens160.enableDebugging(Serial);
-  ens160.begin(&Wire);
-  while (!ens160.init()) {
-    Serial.print(".");
-    delay(1000);
+/** Ensure connection to the MQTT broker. Performs setup of WiFi and MQTT client if they are not connected */
+bool ensure_mqtt_connection() {
+  //If either is disconnected, should likely send discovery message again
+  if (!mqtt_is_connected()) {
+    should_send_mqtt_updates = false;
+    should_send_discovery_message = false;
+    if (!wifi_is_connected()) {
+      setup_wifi();
+    }
+    if (wifi_is_connected()) {
+      mqtt_connect();
+      //mqtt_connect sets flags high if connection works
+    }
   }
-  ens160.startStandardMeasure(); //Set to STANDARD mode for performing operations
-  Serial.println("\nENS160 online");
 
-  //Setup servo motor for bird
-  // servo_idx = ISR_Servo.setupServo(SERVO_PIN, SERVO_MIN_MICROS, SERVO_MAX_MICROS);
-  // birb_position = 0;
-  // Serial.printf("Servo attached to pin %d\n", servo_idx);
-  // ISR_Servo.setPosition(servo_idx, birb_position);
-
-  led_state = true;
-  pinMode(LED_BUILTIN, OUTPUT);
+  return mqtt_is_connected();
+  //TODO: In all cases where WiFi / mqtt fail, use increasing timeouts (30sec, 1min, 3min, 5min)
 }
-//8b = 1000_1011
 
-void loop() {
+/** MQTT callback function for handling messages received on subscribed topics */
+void mqtt_callback(char* topic, byte* payload, unsigned int length) {
+  Serial.printf("MQTT message received on [%s]\n", topic);
+  Serial.print("  '");
+  for(unsigned int i=0; i<length; i++) {
+    Serial.print( (char) payload[i]);
+  }
+  Serial.println("'");
+
+  //Handle writes to birb override topic
+  if (strcmp(topic, MQTT_HA_STATUS_TOPIC) == 0) {
+    Serial.println("Received HA status message");
+    if (strncmp((char*) payload, "online", 6)) {
+      Serial.println("Received 'online' message, sending discovery message next time around");
+      should_send_discovery_message = true;
+      should_send_mqtt_updates = false;
+    } else if (strncmp((char*) payload, "offline", 7)) {
+      Serial.println("Received 'offline' message, disabling mqtt updates");
+      should_send_mqtt_updates = false;
+    } else {
+      Serial.println("Unknown payload for HA status topic");
+    }
+    return;
+  }
+
+  //Handle writes to birb override topic
+  if (strcmp(topic, MQTT_STATE_OVERRIDE_TOPIC) == 0) {
+    Serial.println("Received bird override message");
+    if (strncmp((char*) payload, "OFF", 3) == 0) {
+      Serial.println("Disabling birb state override");
+      birb_state_override = OFF;
+    } else if (strncmp((char*) payload, "ALIVE", 5) == 0) {
+      Serial.println("Overriding birb state to alive");
+      birb_state_override = ALIVE;
+    } else if (strncmp((char*) payload, "DEAD", 4) == 0) {
+      Serial.println("Overriding birb state to dead");
+      birb_state_override = DEAD;
+    } else {
+      Serial.println("Did not identify command for setting birb state override");
+    }
+    return;
+  }
+}
+
+/** Read attached sensors (AHT21 and ENS160), storing values in global variables */
+void read_sensors() {
   Result ens160_result;
-
   //Read temp and RH, use for calibration of ENS160
   aht.getEvent(&hum_event, &temp_event);
   humidity_float = hum_event.relative_humidity;
@@ -164,34 +256,184 @@ void loop() {
   humidity_ens = (uint16_t) (humidity_float * 512);
   ens160.writeCompensation(temp_ens, humidity_ens);
 
+  //Read ENS160
   ens160.wait();
   ens160_result = ens160.update();
   if (ens160_result == RESULT_OK) {
     if (ens160.hasNewData()) {
-      Serial.printf(">AQI-UBA:%d\n", (uint8_t) ens160.getAirQualityIndex_UBA());
-      Serial.printf(">TVOC:%d\n", ens160.getTvoc());
-      Serial.printf(">eCO2:%d\n", ens160.getEco2());
+      aqi_uba = (uint8_t) ens160.getAirQualityIndex_UBA();
+      eco2 = ens160.getEco2();
+      tvoc = ens160.getTvoc();
+      Serial.printf(">AQI-UBA:%d\n", aqi_uba);
+      Serial.printf(">TVOC:%d\n", tvoc);
+      Serial.printf(">eCO2:%d\n", eco2);
     }
-
-    // if (ens160.hasNewGeneralPurposeData()) {
-    //   Serial.printf("ENS160 GPR read");
-    //   Serial.printf("RS0=%0x, RS1=%0x, RS2=%0x, RS3=%0x\n", ens160.getRs0(), ens160.getRs1(), ens160.getRs2(), ens160.getRs3());
-    // }
   } else {
     Serial.printf("ENS160 was not RESULT_OK. Was %02x\n", (uint8_t) ens160_result);
   }
 
-  // birb_position += 10;
-  // if (birb_position > 180) {
-  //   birb_position = 0;
+  //Kill the bird if AQI-UBA is 5, or if override has forced it
+  if (((aqi_uba == 5) && (birb_state_override != ALIVE)) || (birb_state_override == DEAD)) {
+    birb_is_dead = true;
+  } else {
+    birb_is_dead = false;
+  }
+  Serial.printf(">Birb state:%d\n", birb_is_dead);
+}
+
+/** Publish sensor data via MQTT to the specified topic */
+void publish_sensor_data() {
+  char payload_buffer[100];
+  const char* state_str = birb_is_dead ? "ON" : "OFF";
+  snprintf(payload_buffer, 100, "{\"state\": \"%3s\",\"temp\": %2.2f,\"hum\": %2.1f,\"eco2\": %d,\"tvoc\": %d,\"aqi\": %d}", state_str, temp_float, humidity_float, eco2, tvoc, aqi_uba);
+  Serial.printf("Publishing payload '%s'\n", payload_buffer);
+  if (!mqtt_client.publish(MQTT_STATE_TOPIC, payload_buffer)) {
+    Serial.println("Failed to publish MQTT payload!");
+    should_send_mqtt_updates = false;
+  }
+}
+
+/** Wait for some time before performing the next sample */
+void delay_for_next_sample() {
+  //TODO make this smarter, use sleep/deepsleep to save energy
+  Serial.printf("Delaying %d ms until next sample ...\n\n", SAMPLE_PERIOD_MS);
+  // ESP.deepSleep(10e6);
+  delay(SAMPLE_PERIOD_MS);
+}
+
+/** Sets the position of the birb servo, in interval [0;180] degrees */
+void set_birb_position(int target_pos, uint8_t degs_per_second = 30) {
+  float degs_per_step;
+  int delta_degs;
+  int num_steps;
+  float float_pos;
+
+  //Ensure variables within legal ranges
+  if (degs_per_second == 0) {
+    degs_per_second = 20;
+  }
+  if (target_pos > 180) {
+    target_pos = 180;
+  } else if (target_pos < 0) {
+    target_pos = 0;
+  }
+
+  degs_per_step = degs_per_second / ((float) BIRB_STEPS_PER_SECOND);
+  delta_degs = target_pos - birb_position;
+  if (delta_degs == 0) {
+    Serial.printf("Bird target position == current position (%d). Not moving\n", birb_position);
+    return;
+  }
+  num_steps = ABS(delta_degs) / degs_per_step;
+  degs_per_step = SIGN(delta_degs) * degs_per_step;
+
+  Serial.printf("Moving bird from start=%d to target=%d. num_steps=%d, degs_per_step=%2.2f\n", birb_position, target_pos, num_steps, degs_per_step);
+  float_pos = birb_position;
+  for(int step=0; step<num_steps; step++) {
+    float_pos += degs_per_step;
+    ISR_Servo.setPosition(servo_idx, (uint16_t) float_pos);
+    delay(BIRB_STEP_PERIOD_MS);
+  }
+
+  //Ensure rounding errors don't make the bird drift
+  ISR_Servo.setPosition(servo_idx, target_pos);
+  birb_position = target_pos;
+  Serial.printf(">Position:%d\n", birb_position);
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  //These variables will be set true if WiFi and MQTT is connected
+  should_send_discovery_message = false;
+  should_send_mqtt_updates = false;
+  led_state = false;
+  birb_is_dead = false;
+  birb_state_override = OFF;
+
+  //Setup AHT sensor on I2C bus
+  Serial.println("Starting AHT21");
+  aht.begin(&Wire);
+
+  //Setup ENS160 sensor on I2C bus
+  //TODO: Don't block, send unavailable messages if not present
+  Serial.println("Starting ENS160");
+  ens160.enableDebugging(Serial);
+  ens160.begin(&Wire);
+  while (!ens160.init()) {
+    Serial.print(".");
+    delay(1000);
+  }
+  ens160.startStandardMeasure(); //Set to STANDARD mode for performing operations
+  Serial.println("\nENS160 online");
+
+  //Setup servo motor for bird
+  servo_idx = ISR_Servo.setupServo(SERVO_PIN, SERVO_MIN_MICROS, SERVO_MAX_MICROS);
+  birb_position = 0;
+  Serial.printf("Servo attached to pin %d\n", servo_idx);
+  ISR_Servo.setPosition(servo_idx, birb_position);
+
+  // setup_wifi();
+
+  mqtt_client.setServer(MQTT_BROKER_ADDRESS, MQTT_BROKER_PORT);
+  mqtt_client.setCallback(mqtt_callback);
+  // if (wifi_is_connected()) {
+  //   mqtt_connect();
   // }
-  // ISR_Servo.setPosition(servo_idx, birb_position);
+}
 
-  //Debug outputs
-  Serial.println("DEBUG OUTPUTS");
-  print_ens160_compensation_registers();
+void birb_loop() {
+  //Send discovery payload if first time OR re-prompted for discovery (e.g. after HA reboot)
+  //Make this code more robust: If wifi/mqtt is not connected, attempt to reconnect.
+  //Set timer to retry connection if it didn't work
+  ensure_mqtt_connection();
+  mqtt_client.loop();
 
-  delay(10000);
-  digitalWrite(LED_BUILTIN, led_state);
-  led_state = !led_state;
+  if (should_send_discovery_message) {
+    mqtt_client.setBufferSize(2048);
+    bool res = mqtt_client.publish(MQTT_DISCOVERY_TOPIC, MQTT_HA_DISCOVERY_PAYLOAD);
+    if (!res) {
+      Serial.println("Failed to publish discovery payload ... Trying again next time");
+      should_send_discovery_message = true;
+      should_send_mqtt_updates = false;
+    } else {
+      should_send_discovery_message = false;
+      should_send_mqtt_updates = true;
+    }
+  }
+
+  //Make sensor readings
+  read_sensors();
+
+  //Publish data
+  if (should_send_mqtt_updates) {
+    publish_sensor_data();
+  }
+
+  //Change birb position
+  if (birb_is_dead) {
+    set_birb_position(0);
+  } else {
+    set_birb_position(180);
+  }
+
+  //Wait until later
+  delay_for_next_sample();
+}
+
+void loop() {
+  birb_loop();
+  //TODO-list
+  /*
+  - Deep sleep function to save power
+  - Use average of N latest samples instead of current sample to remove noise
+  - Clean up code
+  - Review network handling logic
+    - Increasing timeout to reconnect to wifi/mqtt if not connected
+  - Test functionality to resubmit discovery if HA goes down and comes back up again. Should be no messages in the meantime
+  - Don't block setup if ENS160 is unavailable
+  */
+
 }
