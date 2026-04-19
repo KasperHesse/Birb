@@ -15,7 +15,9 @@
 
 #define WIFI_CONNECT_NUM_ATTEMPTS 10
 #define MQTT_CONNECT_NUM_ATTEMPTS 10
-#define SAMPLE_PERIOD_MS 30000
+#define SAMPLE_PERIOD_MS 10000
+#define AVERAGE_SAMPLE_COUNT 6
+#define MQTT_LOOP_POLL_MS 100
 
 /****AHT21 sensor****/
 #define AHT21_I2C_ADDRESS 0x38
@@ -25,16 +27,28 @@ float humidity_float, temp_float;
 
 /****ENS160 sensor****/
 #define ENS160_I2C_ADDRESS 0x52
-#define BIRB_DOWNSAMPLING_FACTOR 5
+#define AQI_LIMIT          AQI_UBA_POOR //4 out of 5
 ENS160 ens160;
 //humidity and temp reformatted to format required for ENS160 calibration
 uint16_t humidity_ens, temp_ens;
 uint8_t aqi_uba;
 uint16_t tvoc;
 uint16_t eco2;
-uint8_t aqi_samples[BIRB_DOWNSAMPLING_FACTOR];
-uint8_t aqi_latest;
-uint8_t aqi_sample_cnt;
+
+// Averaged sensor values (published to MQTT)
+float avg_temp;
+float avg_humidity;
+uint16_t avg_eco2;
+uint16_t avg_tvoc;
+uint8_t avg_aqi;
+
+// Aggregation state for averaging N samples before publishing.
+float temp_sum;
+float humidity_sum;
+uint32_t eco2_sum;
+uint32_t tvoc_sum;
+float aqi_sum;
+uint8_t measurement_sample_cnt;
 
 
 /****Birb servo****/
@@ -164,13 +178,10 @@ void mqtt_connect() {
     Serial.println(num_attempts);
 
     if (mqtt_client.connect(MQTT_CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD, 0, 0, 0, 0, 0)) {
-      should_send_discovery_message = true;
-      should_send_mqtt_updates = true;
       Serial.println("MQTT connection established. Subscribing to topics");
-
-      mqtt_client.publish("mqtt_test/outTopic", "hello world");
       mqtt_client.subscribe(MQTT_HA_STATUS_TOPIC, 1);
       mqtt_client.subscribe(MQTT_STATE_OVERRIDE_TOPIC, 1);
+      should_send_mqtt_updates = true;
       break;
     } else {
       Serial.print("failed, rc=");
@@ -185,8 +196,6 @@ void mqtt_connect() {
 bool ensure_mqtt_connection() {
   if (!mqtt_is_connected()) {
     should_send_mqtt_updates = false;
-    //Discovery must be re-sent after reconnect so HA re-registers entities
-    should_send_discovery_message = false;
     if (!wifi_is_connected()) {
       setup_wifi();
     }
@@ -231,42 +240,20 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     if (strncmp((char*) payload, "OFF", 3) == 0) {
       Serial.println("Disabling birb state override");
       birb_state_override = OFF;
+      birb_is_dead = (avg_aqi >= AQI_LIMIT);
     } else if (strncmp((char*) payload, "ALIVE", 5) == 0) {
       Serial.println("Overriding birb state to alive");
       birb_state_override = ALIVE;
+      birb_is_dead = false;
     } else if (strncmp((char*) payload, "DEAD", 4) == 0) {
       Serial.println("Overriding birb state to dead");
       birb_state_override = DEAD;
+      birb_is_dead = true;
     } else {
       Serial.println("Did not identify command for setting birb state override");
     }
     return;
   }
-}
-
-/** Compute the mode (most common) of the latest AQI_UBA samples
- * Serves as a simple filter to remove high-frequency noise in the AQI sampling
- */
-uint8_t compute_aqi_mode() {
-  uint8_t aqi_mode;
-  uint8_t aqi_mode_cnt;
-  //Index [0] is not used. Created with 6 indices to make loops below simpler
-  uint8_t cnts[6] = {0,0,0,0,0,0};
-
-  //Count occurences of each sample
-  aqi_mode_cnt = 0;
-  aqi_mode = 0;
-  for(uint8_t i=0; i<BIRB_DOWNSAMPLING_FACTOR; i++) {
-    cnts[aqi_samples[i]]++;
-  }
-  //Find most common aqi value, preferring larger aqi's
-  for(uint8_t i=1; i<=5; i++) {
-    if (cnts[i] >= aqi_mode_cnt) {
-      aqi_mode = i;
-      aqi_mode_cnt = cnts[i];
-    }
-  }
-  return aqi_mode;
 }
 
 /** Read attached sensors (AHT21 and ENS160), storing values in global variables */
@@ -300,23 +287,39 @@ void read_sensors() {
     Serial.printf("ENS160 was not RESULT_OK. Was %02x\n", (uint8_t) ens160_result);
   }
 
-  //Update AQI downsampling
-  aqi_samples[aqi_sample_cnt] = aqi_uba;
-  aqi_sample_cnt++;
-  if (aqi_latest == 0xFF) { //First sample after powerup
-    aqi_latest = aqi_uba;
-  }
-  if (aqi_sample_cnt == BIRB_DOWNSAMPLING_FACTOR) {
-    aqi_latest = compute_aqi_mode();
-    Serial.printf(">AQI_Latest:%d\n", aqi_latest);
-    aqi_sample_cnt = 0;
-  }
+}
 
-  //Kill the bird if AQI-UBA is 5, or if override has forced it
-  if (((aqi_latest == 5) && (birb_state_override != ALIVE)) || (birb_state_override == DEAD)) {
-    birb_is_dead = true;
-  } else {
-    birb_is_dead = false;
+void reset_accumulators() {
+  temp_sum = 0.0f;
+  humidity_sum = 0.0f;
+  eco2_sum = 0;
+  tvoc_sum = 0;
+  aqi_sum = 0;
+  measurement_sample_cnt = 0;
+}
+
+void accumulate_measurements() {
+  temp_sum += temp_float;
+  humidity_sum += humidity_float;
+  eco2_sum += eco2;
+  tvoc_sum += tvoc;
+  aqi_sum += aqi_uba;
+  measurement_sample_cnt++;
+}
+
+void finalize_averaged_measurements() {
+  avg_temp = temp_sum / measurement_sample_cnt;
+  avg_humidity = humidity_sum / measurement_sample_cnt;
+  avg_eco2 = (uint16_t) (eco2_sum / measurement_sample_cnt);
+  avg_tvoc = (uint16_t) (tvoc_sum / measurement_sample_cnt);
+  avg_aqi = uint8_t ((aqi_sum / measurement_sample_cnt) + 0.5f); // round to nearest whole AQI bucket
+
+  Serial.printf(">Averaged over %d samples: temp=%2.1f hum=%2.1f eco2=%d tvoc=%d aqi=%d\n",
+      measurement_sample_cnt, avg_temp, avg_humidity, avg_eco2, avg_tvoc, avg_aqi);
+
+  //Set birb state if not forced
+  if (birb_state_override == OFF) {
+    birb_is_dead = (avg_aqi >= AQI_LIMIT);
   }
   Serial.printf(">Birb state:%d\n", birb_is_dead);
 }
@@ -325,7 +328,7 @@ void read_sensors() {
 void publish_sensor_data() {
   char payload_buffer[100];
   const char* state_str = birb_is_dead ? "ON" : "OFF";
-  snprintf(payload_buffer, 100, "{\"state\": \"%3s\",\"temp\": %2.2f,\"hum\": %2.1f,\"eco2\": %d,\"tvoc\": %d,\"aqi\": %d}", state_str, temp_float, humidity_float, eco2, tvoc, aqi_latest);
+  snprintf(payload_buffer, 100, "{\"state\": \"%3s\",\"temp\": %2.1f,\"hum\": %2.1f,\"eco2\": %d,\"tvoc\": %d,\"aqi\": %d}", state_str, avg_temp, avg_humidity, avg_eco2, avg_tvoc, avg_aqi);
   Serial.printf("Publishing payload '%s'\n", payload_buffer);
   if (!mqtt_client.publish(MQTT_STATE_TOPIC, payload_buffer)) {
     Serial.println("Failed to publish MQTT payload!");
@@ -339,13 +342,24 @@ void delay_for_next_sample() {
   //TODO: Deep sleep to save energy: replace delay() with ESP.deepSleep(SAMPLE_PERIOD_MS * 1000UL).
   //  Caveats:
   //  - Deep sleep causes a full reset on wake; WiFi and MQTT must reconnect every cycle.
-  //  - Persistent state (aqi_samples, aqi_sample_cnt, aqi_latest, birb_position) must be
+  //  - Persistent state (temp_sum/humidity_sum/eco2_sum/tvoc_sum/aqi_sum,
+  //    measurement_sample_cnt, aqi_latest, birb_position) must be
   //    stored in RTC memory: prefix globals with RTC_DATA_ATTR.
   //  - MQTT subscriptions (state_override) won't persist; re-subscribe on each wake.
   //  - Connect D0 (GPIO16) to RST pin to enable wake-from-deep-sleep on ESP8266.
+  uint32_t start_ms;
+  uint32_t elapsed_ms;
+
   Serial.printf("Delaying %d ms until next sample ...\n\n", SAMPLE_PERIOD_MS);
   // ESP.deepSleep(SAMPLE_PERIOD_MS * 1000UL);
-  delay(SAMPLE_PERIOD_MS);
+
+  start_ms = millis();
+  do {
+    mqtt_client.loop();
+    delay(MQTT_LOOP_POLL_MS);
+    yield();
+    elapsed_ms = millis() - start_ms;
+  } while (elapsed_ms < SAMPLE_PERIOD_MS);
 }
 
 /** Sets the position of the birb servo, in interval [0;180] degrees */
@@ -390,10 +404,12 @@ void set_birb_position(int target_pos, uint8_t degs_per_second = 30) {
 }
 
 void set_birb_position_fast(int target_pos) {
-  Serial.printf("Moving bird from start=%d to target=%d\n", birb_position, target_pos);
-  ISR_Servo.setPosition(servo_idx, target_pos);
-  birb_position = target_pos;
-  Serial.printf(">Position:%d\n", birb_position);
+  if (birb_position != target_pos) {
+    Serial.printf("Moving bird from start=%d to target=%d\n", birb_position, target_pos);
+    ISR_Servo.setPosition(servo_idx, target_pos);
+    birb_position = target_pos;
+    Serial.printf(">Position:%d\n", birb_position);
+  }
 }
 
 
@@ -401,11 +417,12 @@ void setup() {
   Serial.begin(115200);
   Wire.begin(SDA_PIN, SCL_PIN);
 
-  //These variables will be set true if WiFi and MQTT is connected
-  should_send_discovery_message = false;
-  should_send_mqtt_updates = false;
+  should_send_discovery_message = true;
+  should_send_mqtt_updates = true;
+  //We default to a live bird
   birb_is_dead = false;
   birb_state_override = OFF;
+  avg_aqi = 0;
 
   //Setup AHT sensor on I2C bus
   Serial.println("Starting AHT21");
@@ -426,9 +443,7 @@ void setup() {
   ens160.startStandardMeasure(); //Set to STANDARD mode for performing operations
   Serial.println("\nENS160 online");
 
-  //Setup AQI downsampling
-  aqi_sample_cnt = 0;
-  aqi_latest = 0xFF;
+  reset_accumulators();
 
   //Setup servo motor for bird
   servo_idx = ISR_Servo.setupServo(SERVO_PIN, SERVO_MIN_MICROS, SERVO_MAX_MICROS);
@@ -438,6 +453,7 @@ void setup() {
 
   mqtt_client.setServer(MQTT_BROKER_ADDRESS, MQTT_BROKER_PORT);
   mqtt_client.setCallback(mqtt_callback);
+  mqtt_client.setBufferSize(2048); //Large buffer required for discovery message
 }
 
 void birb_loop() {
@@ -447,30 +463,33 @@ void birb_loop() {
   ensure_mqtt_connection();
   mqtt_client.loop();
 
-  bool discovery_just_sent = false;
   if (should_send_discovery_message) {
-    mqtt_client.setBufferSize(2048);
     bool res = mqtt_client.publish(MQTT_DISCOVERY_TOPIC, MQTT_HA_DISCOVERY_PAYLOAD);
     if (!res) {
       Serial.println("Failed to publish discovery payload ... Trying again next time");
       should_send_discovery_message = true;
       should_send_mqtt_updates = false;
     } else {
+      Serial.println("Published discovery payload");
       should_send_discovery_message = false;
       should_send_mqtt_updates = true;
-      discovery_just_sent = true; // skip sensor publish this iteration; allow HA to register entities first
     }
   }
 
-  //Make sensor readings
+  //Take one measurement every SAMPLE_PERIOD_MS and aggregate over AVERAGE_SAMPLE_COUNT samples.
   read_sensors();
+  accumulate_measurements();
 
-  //Publish data - skip on the same iteration as discovery to allow HA to register entities
-  if (should_send_mqtt_updates && !discovery_just_sent) {
-    publish_sensor_data();
+  //Publish averaged data only after the full sample window is complete.
+  if (measurement_sample_cnt == AVERAGE_SAMPLE_COUNT) {
+    finalize_averaged_measurements();
+    if (should_send_mqtt_updates) {
+      publish_sensor_data();
+    }
+    reset_accumulators();
   }
 
-  //Change birb position
+  //Change birb position using averaged AQI / override state.
   if (birb_is_dead) {
     set_birb_position_fast(0);
   } else {
